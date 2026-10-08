@@ -1,0 +1,58 @@
+---
+source: compiler-core/src/javascript/tests/case_clause_guards.rs
+expression: "\npub type Wibble {\n  Wibble(v: Int)\n  Wobble(v: Int)\n  Warble\n}\n\npub fn main(wibble) {\n  case wibble {\n    Wibble(v) | Wobble(v) -> v\n    Warble -> 0\n  }\n}\n"
+---
+----- SOURCE CODE
+
+pub type Wibble {
+  Wibble(v: Int)
+  Wobble(v: Int)
+  Warble
+}
+
+pub fn main(wibble) {
+  case wibble {
+    Wibble(v) | Wobble(v) -> v
+    Warble -> 0
+  }
+}
+
+
+----- COMPILED JAVASCRIPT
+import { CustomType as $CustomType } from "../gleam.mjs";
+
+export class Wibble extends $CustomType {
+  constructor(v) {
+    super();
+    this.v = v;
+  }
+}
+export const Wibble$Wibble = (v) => new Wibble(v);
+export const Wibble$isWibble = (value) => value instanceof Wibble;
+export const Wibble$Wibble$v = (value) => value.v;
+export const Wibble$Wibble$0 = (value) => value.v;
+
+export class Wobble extends $CustomType {
+  constructor(v) {
+    super();
+    this.v = v;
+  }
+}
+export const Wibble$Wobble = (v) => new Wobble(v);
+export const Wibble$isWobble = (value) => value instanceof Wobble;
+export const Wibble$Wobble$v = (value) => value.v;
+export const Wibble$Wobble$0 = (value) => value.v;
+
+export class Warble extends $CustomType {}
+export const Wibble$Warble$const = new Warble();
+export const Wibble$Warble = () => Wibble$Warble$const;
+export const Wibble$isWarble = (value) => value instanceof Warble;
+
+export function main(wibble) {
+  if (wibble instanceof Wibble || wibble instanceof Wobble) {
+    let v = wibble.v;
+    return v;
+  } else {
+    return 0;
+  }
+}

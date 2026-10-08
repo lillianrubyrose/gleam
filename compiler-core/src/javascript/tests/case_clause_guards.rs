@@ -625,3 +625,23 @@ pub fn main() {
 "
     );
 }
+
+#[test]
+fn alternative_patterns_merge_same_field_bindings() {
+    assert_js!(
+        "
+pub type Wibble {
+  Wibble(v: Int)
+  Wobble(v: Int)
+  Warble
+}
+
+pub fn main(wibble) {
+  case wibble {
+    Wibble(v) | Wobble(v) -> v
+    Warble -> 0
+  }
+}
+"
+    );
+}

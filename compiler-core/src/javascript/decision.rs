@@ -26,6 +26,7 @@ use pretty_arena::*;
 use src_span::SrcSpan;
 use std::{
     collections::{HashMap, HashSet},
+    ops::Range,
     sync::OnceLock,
 };
 
@@ -610,42 +611,66 @@ impl<'a, 'doc> CasePrinter<'_, '_, 'a, '_, 'doc> {
             None
         };
 
+        // Record the values of variables introduced by each check so even if variable ids don't match we can still test if the decisions are equivalent.
+        for (check, _) in choices {
+            // We never merge BitArray checks, as they might need specific segment bindings prior to evaluating conditions.
+            if !matches!(check, RuntimeCheck::BitArray { .. }) {
+                self.variables.record_check_assignments(arena, var, check);
+            }
+        }
+
         let mut if_ = CaseBody::Statements(EMPTY_DOCUMENT);
-        for (i, (check, decision)) in choices.iter().enumerate() {
-            self.variables.record_check_assignments(arena, var, check);
+        for (i, choice_group) in group_adjacent_choices(&self.variables, choices)
+            .into_iter()
+            .enumerate()
+        {
+            let decision = &choices.get(choice_group.start).expect("non empty group").1;
 
-            // For each check we generate:
-            // - the document to perform such check
-            // - the body to run if the check is successful
+            // For each group we generate:
+            // - the document to perform its checks
+            // - the body to run if any of the checks are successful
             // - the assignments we need to bring all the bit array segments
-            //   referenced by this check
+            //   referenced by those checks
             let (check_doc, body, mut segment_assignments) = self.inside_new_scope(|this| {
-                let segment_assignments =
-                    this.variables.bit_array_segment_assignments(arena, check);
+                let mut segment_assignments = vec![];
+                let mut checks = Vec::with_capacity(choice_group.len());
+                for (check, _) in choices
+                    .get(choice_group.clone())
+                    .expect("group is in range")
+                {
+                    // We never merge BitArray checks which means each check gets its own group and can record its assignments here.
+                    if matches!(check, RuntimeCheck::BitArray { .. }) {
+                        this.variables.record_check_assignments(arena, var, check);
+                    }
+                    segment_assignments
+                        .append(&mut this.variables.bit_array_segment_assignments(arena, check));
 
-                // If the pattern matches on a single character, use the character
-                // code instead of `.startsWith`.
-                let check_doc = if let Some(code) = single_character_prefix_code(check) {
-                    let first_character = if let Some(variable) = &first_character_variable {
-                        variable.to_doc(arena)
+                    // If the pattern matches on a single character, use the character
+                    // code instead of `.startsWith`.
+                    let check_doc = if let Some(code) = single_character_prefix_code(check) {
+                        let first_character = if let Some(variable) = &first_character_variable {
+                            variable.to_doc(arena)
+                        } else {
+                            // This is the only single-character match in this `case`
+                            // expression, so we don't bind it to a variable and just
+                            // call `.charCodeAt` inline. This is still faster than
+                            // `.startsWith`.
+                            let string = this.variables.get_value(var);
+                            docvec![arena, string, DOT_CHAR_CODE_AT_ZERO_DOCUMENT]
+                        };
+
+                        docvec![
+                            arena,
+                            first_character,
+                            SPACE_TRIPLE_EQUAL_SPACE_DOCUMENT,
+                            code
+                        ]
                     } else {
-                        // This is the only single-character match in this `case`
-                        // expression, so we don't bind it to a variable and just
-                        // call `.charCodeAt` inline. This is still faster than
-                        // `.startsWith`.
-                        let string = this.variables.get_value(var);
-                        docvec![arena, string, DOT_CHAR_CODE_AT_ZERO_DOCUMENT]
+                        this.variables.runtime_check(arena, var, check)
                     };
-
-                    docvec![
-                        arena,
-                        first_character,
-                        SPACE_TRIPLE_EQUAL_SPACE_DOCUMENT,
-                        code
-                    ]
-                } else {
-                    this.variables.runtime_check(arena, var, check)
-                };
+                    checks.push(check_doc);
+                }
+                let check_doc = arena.join(checks, SPACE_DOUBLE_VERTICAL_BAR_SPACE_DOCUMENT);
 
                 let body = this.decision(arena, decision);
                 (check_doc, body, segment_assignments)
@@ -671,7 +696,11 @@ impl<'a, 'doc> CasePrinter<'_, '_, 'a, '_, 'doc> {
                 CaseBody::If { check, body } => (
                     docvec![
                         arena,
-                        check_doc,
+                        if choice_group.len() > 1 {
+                            check_doc.surround(arena, OPEN_PAREN_DOCUMENT, CLOSE_PAREN_DOCUMENT)
+                        } else {
+                            check_doc
+                        },
                         SPACE_DOUBLE_AMPERSAND_BREAK_DOCUMENT,
                         check
                     ],
@@ -717,7 +746,11 @@ impl<'a, 'doc> CasePrinter<'_, '_, 'a, '_, 'doc> {
                 } if decision == fallback => (
                     docvec![
                         arena,
-                        check_doc,
+                        if choice_group.len() > 1 {
+                            check_doc.surround(arena, OPEN_PAREN_DOCUMENT, CLOSE_PAREN_DOCUMENT)
+                        } else {
+                            check_doc
+                        },
                         SPACE_DOUBLE_AMPERSAND_BREAK_DOCUMENT,
                         check
                     ],
@@ -1081,6 +1114,323 @@ fn derived_variables(
         derived.extend(introduced.iter().map(|variable| variable.id));
         derived
     })
+}
+
+fn variables_equivalent(
+    a: &Variable,
+    b: &Variable,
+    equivalent_variables: &HashMap<usize, usize>,
+) -> bool {
+    a.id == b.id || equivalent_variables.get(&a.id) == Some(&b.id)
+}
+
+/// Group adjacence choices where the decisions can share a body.
+fn group_adjacent_choices(
+    variables: &Variables<'_, '_, '_, '_>,
+    choices: &[(RuntimeCheck, Decision)],
+) -> Vec<Range<usize>> {
+    choices
+        .chunk_by(
+            |(check_a, decision_a), (check_b, decision_b)| match (check_a, check_b) {
+                (RuntimeCheck::BitArray { .. }, _) | (_, RuntimeCheck::BitArray { .. }) => false,
+                _ => {
+                    let mut equivalent_variables = HashMap::new();
+
+                    // Pair vars introduced by outer checks if they produce the same js value.
+                    match (check_a, check_b) {
+                        (
+                            RuntimeCheck::StringPrefix { rest: a, .. },
+                            RuntimeCheck::StringPrefix { rest: b, .. },
+                        ) if a.id == b.id || variables.get_value(a) == variables.get_value(b) => {
+                            let _ = equivalent_variables.insert(a.id, b.id);
+                        }
+
+                        (
+                            RuntimeCheck::Tuple { elements: a, .. },
+                            RuntimeCheck::Tuple { elements: b, .. },
+                        )
+                        | (
+                            RuntimeCheck::Variant { fields: a, .. },
+                            RuntimeCheck::Variant { fields: b, .. },
+                        ) => {
+                            for (a, b) in a.iter().zip(b) {
+                                if a.id == b.id || variables.get_value(a) == variables.get_value(b)
+                                {
+                                    let _ = equivalent_variables.insert(a.id, b.id);
+                                }
+                            }
+                        }
+
+                        (
+                            RuntimeCheck::NonEmptyList {
+                                first: first_a,
+                                rest: rest_a,
+                            },
+                            RuntimeCheck::NonEmptyList {
+                                first: first_b,
+                                rest: rest_b,
+                            },
+                        ) => {
+                            if first_a.id == first_b.id
+                                || variables.get_value(first_a) == variables.get_value(first_b)
+                            {
+                                let _ = equivalent_variables.insert(first_a.id, first_b.id);
+                            }
+
+                            if rest_a.id == rest_b.id
+                                || variables.get_value(rest_a) == variables.get_value(rest_b)
+                            {
+                                let _ = equivalent_variables.insert(rest_a.id, rest_b.id);
+                            }
+                        }
+
+                        _ => {}
+                    }
+
+                    decisions_equivalent(decision_a, decision_b, &mut equivalent_variables)
+                }
+            },
+        )
+        .scan(0, |begin, group| {
+            let end = *begin + group.len();
+            let r = *begin..end;
+            *begin = end;
+            Some(r)
+        })
+        .collect()
+}
+
+fn decisions_equivalent(
+    a: &Decision,
+    b: &Decision,
+    equivalent_variables: &mut HashMap<usize, usize>,
+) -> bool {
+    match (a, b) {
+        (Decision::Run { body: a }, Decision::Run { body: b }) => {
+            bodies_equivalent(a, b, equivalent_variables)
+        }
+        (
+            Decision::Guard {
+                guard: guard_a,
+                if_true: if_true_a,
+                if_false: if_false_a,
+            },
+            Decision::Guard {
+                guard: guard_b,
+                if_true: if_true_b,
+                if_false: if_false_b,
+            },
+        ) => {
+            guard_a == guard_b
+                && bodies_equivalent(if_true_a, if_true_b, equivalent_variables)
+                && decisions_equivalent(if_false_a, if_false_b, equivalent_variables)
+        }
+        (
+            Decision::Switch {
+                var: var_a,
+                choices: choices_a,
+                fallback: fallback_a,
+                fallback_check: fallback_check_a,
+            },
+            Decision::Switch {
+                var: var_b,
+                choices: choices_b,
+                fallback: fallback_b,
+                fallback_check: fallback_check_b,
+            },
+        ) => {
+            if !variables_equivalent(var_a, var_b, equivalent_variables)
+                || choices_a.len() != choices_b.len()
+            {
+                return false;
+            }
+
+            for ((check_a, decision_a), (check_b, decision_b)) in choices_a.iter().zip(choices_b) {
+                if !runtime_checks_equivalent(check_a, check_b, equivalent_variables) {
+                    return false;
+                }
+
+                if !decisions_equivalent(decision_a, decision_b, equivalent_variables) {
+                    return false;
+                }
+            }
+
+            if !fallback_checks_equivalent(fallback_check_a, fallback_check_b, equivalent_variables)
+            {
+                return false;
+            }
+
+            decisions_equivalent(fallback_a, fallback_b, equivalent_variables)
+        }
+        (Decision::Fail, Decision::Fail) => true,
+        _ => false,
+    }
+}
+
+fn bodies_equivalent(a: &Body, b: &Body, equivalent_variables: &HashMap<usize, usize>) -> bool {
+    if a.clause_index != b.clause_index || a.bindings.len() != b.bindings.len() {
+        return false;
+    }
+
+    a.bindings
+        .iter()
+        .zip(&b.bindings)
+        .all(|((name_a, value_a), (name_b, value_b))| {
+            name_a == name_b && bound_values_equivalent(value_a, value_b, equivalent_variables)
+        })
+}
+
+fn bound_values_equivalent(
+    a: &BoundValue,
+    b: &BoundValue,
+    equivalent_variables: &HashMap<usize, usize>,
+) -> bool {
+    match (a, b) {
+        (BoundValue::Variable(a), BoundValue::Variable(b)) => {
+            variables_equivalent(a, b, equivalent_variables)
+        }
+        (BoundValue::LiteralString(a), BoundValue::LiteralString(b)) => a == b,
+        (BoundValue::LiteralInt(a), BoundValue::LiteralInt(b)) => a == b,
+        (BoundValue::LiteralFloat(a), BoundValue::LiteralFloat(b)) => a == b,
+        (
+            BoundValue::BitArraySlice {
+                bit_array: bit_array_a,
+                read_action: read_action_a,
+            },
+            BoundValue::BitArraySlice {
+                bit_array: bit_array_b,
+                read_action: read_action_b,
+            },
+        ) => {
+            variables_equivalent(bit_array_a, bit_array_b, equivalent_variables)
+                && read_action_a == read_action_b
+        }
+        (
+            BoundValue::StringSlice {
+                subject: subject_a,
+                prefix: prefix_a,
+            },
+            BoundValue::StringSlice {
+                subject: subject_b,
+                prefix: prefix_b,
+            },
+        ) => {
+            variables_equivalent(subject_a, subject_b, equivalent_variables) && prefix_a == prefix_b
+        }
+        _ => false,
+    }
+}
+
+fn runtime_checks_equivalent(
+    a: &RuntimeCheck,
+    b: &RuntimeCheck,
+    equivalent_variables: &mut HashMap<usize, usize>,
+) -> bool {
+    match (a, b) {
+        (RuntimeCheck::Int { int_value: a }, RuntimeCheck::Int { int_value: b }) => a == b,
+        (
+            RuntimeCheck::Float { float_value: a, .. },
+            RuntimeCheck::Float { float_value: b, .. },
+        ) => a == b,
+        (RuntimeCheck::String { value: a }, RuntimeCheck::String { value: b }) => a == b,
+        (
+            RuntimeCheck::StringPrefix {
+                prefix: prefix_a,
+                rest: rest_a,
+            },
+            RuntimeCheck::StringPrefix {
+                prefix: prefix_b,
+                rest: rest_b,
+            },
+        ) => {
+            if prefix_a != prefix_b {
+                return false;
+            }
+
+            let _ = equivalent_variables.insert(rest_a.id, rest_b.id);
+            true
+        }
+        (
+            RuntimeCheck::Tuple {
+                size: size_a,
+                elements: elements_a,
+            },
+            RuntimeCheck::Tuple {
+                size: size_b,
+                elements: elements_b,
+            },
+        ) => {
+            if size_a != size_b || elements_a.len() != elements_b.len() {
+                return false;
+            }
+
+            for (a, b) in elements_a.iter().zip(elements_b) {
+                let _ = equivalent_variables.insert(a.id, b.id);
+            }
+
+            true
+        }
+        (RuntimeCheck::BitArray { .. }, RuntimeCheck::BitArray { .. }) => false,
+        (
+            RuntimeCheck::Variant {
+                match_: match_a,
+                index: index_a,
+                labels: labels_a,
+                fields: fields_a,
+            },
+            RuntimeCheck::Variant {
+                match_: match_b,
+                index: index_b,
+                labels: labels_b,
+                fields: fields_b,
+            },
+        ) => {
+            if match_a != match_b
+                || index_a != index_b
+                || labels_a != labels_b
+                || fields_a.len() != fields_b.len()
+            {
+                return false;
+            }
+
+            for (a, b) in fields_a.iter().zip(fields_b) {
+                let _ = equivalent_variables.insert(a.id, b.id);
+            }
+
+            true
+        }
+        (
+            RuntimeCheck::NonEmptyList {
+                first: first_a,
+                rest: rest_a,
+            },
+            RuntimeCheck::NonEmptyList {
+                first: first_b,
+                rest: rest_b,
+            },
+        ) => {
+            let _ = equivalent_variables.insert(first_a.id, first_b.id);
+            let _ = equivalent_variables.insert(rest_a.id, rest_b.id);
+            true
+        }
+        (RuntimeCheck::EmptyList, RuntimeCheck::EmptyList) => true,
+        _ => false,
+    }
+}
+
+fn fallback_checks_equivalent(
+    a: &FallbackCheck,
+    b: &FallbackCheck,
+    equivalent_variables: &mut HashMap<usize, usize>,
+) -> bool {
+    match (a, b) {
+        (FallbackCheck::InfiniteCatchAll, FallbackCheck::InfiniteCatchAll) => true,
+        (FallbackCheck::RuntimeCheck { check: a }, FallbackCheck::RuntimeCheck { check: b }) => {
+            runtime_checks_equivalent(a, b, equivalent_variables)
+        }
+        (FallbackCheck::CatchAll { .. }, FallbackCheck::CatchAll { .. }) => true,
+        _ => false,
+    }
 }
 
 pub fn let_<'a, 'doc>(
