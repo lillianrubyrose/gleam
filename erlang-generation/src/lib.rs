@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 The Gleam contributors
 
+#[cfg(test)]
+mod tests;
+
 use ecow::EcoString;
 use itertools::Itertools;
 use num_bigint::BigInt;
@@ -83,6 +86,29 @@ impl ErlangModuleName {
     /// The Erlang/OTP `unicode` module.
     pub fn unicode() -> Self {
         Self("unicode".into())
+    }
+}
+
+pub enum ErlangBuiltInType {
+    Any,
+    Integer,
+    Binary,
+    Boolean,
+    Float,
+    Bitstring,
+    List,
+}
+impl ErlangBuiltInType {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ErlangBuiltInType::Any => "any",
+            ErlangBuiltInType::Integer => "integer",
+            ErlangBuiltInType::Binary => "binary",
+            ErlangBuiltInType::Boolean => "boolean",
+            ErlangBuiltInType::Float => "float",
+            ErlangBuiltInType::Bitstring => "bitstring",
+            ErlangBuiltInType::List => "list",
+        }
     }
 }
 
@@ -466,8 +492,26 @@ pub trait ErlangBuilder<Output> {
     ///
     fn end_function_type(&mut self, function_type: Self::FunctionType);
 
-    /// This starts a named type (either defined previously in this module, or
-    /// a built-in Erlang type) with the given name.
+    /// This starts a built-in Erlang named type with the given name.
+    /// Any code generated after this is gonna be an argument of the open
+    /// named type type until `end_named_type` is called.
+    ///
+    /// For example:
+    ///
+    /// ```text
+    /// let type_ = builder.start_named_type("any");
+    /// builder.end_named_type(type_);
+    /// ```
+    ///
+    /// Corresponds to:
+    ///
+    /// ```erl
+    /// any().
+    /// ```
+    ///
+    fn start_built_in_named_type(&mut self, type_: ErlangBuiltInType) -> Self::NamedType;
+
+    /// This starts a user defined named type with the given name.
     /// Any code generated after this is gonna be an argument of the open
     /// named type type until `end_named_type` is called.
     ///
@@ -484,7 +528,7 @@ pub trait ErlangBuilder<Output> {
     /// wibble().
     /// ```
     ///
-    fn start_named_type(&mut self, name: &str) -> Self::NamedType;
+    fn start_custom_named_type(&mut self, name: &str) -> Self::NamedType;
 
     /// This takes a named type and closes it.
     /// Code generated after this is not gonna be part of this named type.
@@ -2027,7 +2071,15 @@ impl ErlangBuilder<String> for ErlangSourceBuilder {
         self.close_currently_open_item();
     }
 
-    fn start_named_type(&mut self, name: &str) -> Self::NamedType {
+    fn start_built_in_named_type(&mut self, type_: ErlangBuiltInType) -> Self::NamedType {
+        self.new_type();
+        self.position
+            .push(ErlangSourceBuilderPosition::NamedType { first: true });
+        self.code.push_str(type_.as_str());
+        self.code.push('(');
+    }
+
+    fn start_custom_named_type(&mut self, name: &str) -> Self::NamedType {
         self.new_type();
         self.position
             .push(ErlangSourceBuilderPosition::NamedType { first: true });
@@ -4046,10 +4098,7 @@ impl<'line_numbers> ErlangBuilder<Vec<u8>> for ErlangBinaryBuilder<'line_numbers
         //   becomes
         // {attribute,ANNO,doc,Content}
         self.attribute_tuple("doc");
-        match content {
-            DocContent::String(content) => self.etf.binary(content.len() as u32, content.bytes()),
-            DocContent::False => self.etf.atom("false"),
-        }
+        self.doc_content(content);
     }
 
     fn moduledoc_attribute(&mut self, content: DocContent<'_>) {
@@ -4059,10 +4108,7 @@ impl<'line_numbers> ErlangBuilder<Vec<u8>> for ErlangBinaryBuilder<'line_numbers
         //   becomes
         // {attribute,ANNO,moduledoc,Content}
         self.attribute_tuple("moduledoc");
-        match content {
-            DocContent::String(content) => self.etf.binary(content.len() as u32, content.bytes()),
-            DocContent::False => self.etf.atom("false"),
-        }
+        self.doc_content(content);
     }
 
     fn compile_attribute<'a>(&mut self, arguments: impl IntoIterator<Item = &'a str>) {
@@ -4268,7 +4314,7 @@ impl<'line_numbers> ErlangBuilder<Vec<u8>> for ErlangBinaryBuilder<'line_numbers
         }
     }
 
-    fn start_named_type(&mut self, name: &str) -> Self::NamedType {
+    fn start_built_in_named_type(&mut self, type_: ErlangBuiltInType) -> Self::NamedType {
         self.new_type();
         self.position
             .push(BinaryBuilderPosition::NamedType { arguments: 0 });
@@ -4278,6 +4324,22 @@ impl<'line_numbers> ErlangBuilder<Vec<u8>> for ErlangBinaryBuilder<'line_numbers
         // {type,ANNO,N,[Rep(T_1), ..., Rep(T_k)]}
         self.etf.small_tuple(4);
         self.etf.atom("type");
+        self.annotation(None);
+        self.etf.atom(type_.as_str());
+
+        self.etf.start_list()
+    }
+
+    fn start_custom_named_type(&mut self, name: &str) -> Self::NamedType {
+        self.new_type();
+        self.position
+            .push(BinaryBuilderPosition::NamedType { arguments: 0 });
+
+        // N(T_1, ..., T_k)
+        //   becomes
+        // {user_type,ANNO,N,[Rep(T_1), ..., Rep(T_k)]}
+        self.etf.small_tuple(4);
+        self.etf.atom("user_type");
         self.annotation(None);
         self.etf.atom(name);
 
@@ -5351,6 +5413,13 @@ impl<'line_numbers> ErlangBinaryBuilder<'line_numbers> {
             BinaryBuilderPosition::CaseClause {
                 expected: expected @ ExpectedBinaryCaseClauseItem::Pattern,
             } => *expected = ExpectedBinaryCaseClauseItem::Guards { guard: false },
+        }
+    }
+
+    fn doc_content(&mut self, content: DocContent<'_>) {
+        match content {
+            DocContent::String(content) => self.etf.binary(content.len() as u32, content.bytes()),
+            DocContent::False => self.etf.atom("false"),
         }
     }
 

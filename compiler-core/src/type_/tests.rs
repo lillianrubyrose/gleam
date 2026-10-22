@@ -931,7 +931,6 @@ fn infer_module_type_retention_test() {
             minimum_required_version: Version::new(0, 1, 0),
             type_aliases: HashMap::new(),
             documentation: Vec::new(),
-            contains_echo: false,
             references: References::default(),
         }
     );
@@ -3654,4 +3653,27 @@ const list = [3, 4, 5]
 pub const full_list = [1.0, 2.0, ..list]
 "
     );
+}
+
+#[test]
+fn redundant_list_prepend_variable() {
+    assert_module_error!(
+        "fn main() {
+  let wibble = [1, 2]
+  let wobble = [..wibble]
+}"
+    );
+}
+
+#[test]
+fn redundant_list_prepend_constant() {
+    assert_module_error!(
+        "const wibble = [1, 2]
+const wobble = [..wibble]"
+    );
+}
+
+#[test]
+fn redundant_list_prepend_nested() {
+    assert_module_error!("const wibble = [..[..[..[..[1, 2]]]]]");
 }

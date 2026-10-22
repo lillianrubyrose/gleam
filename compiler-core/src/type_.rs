@@ -29,9 +29,9 @@ use printer::Names;
 
 use crate::{
     ast::{
-        ArgNames, BitArraySegment, CallArg, Constant, DefinitionLocation, Pattern, Publicity,
-        TypedConstant, TypedExpr, TypedPattern, TypedPatternBitArraySegment, UntypedMultiPattern,
-        UntypedPattern, UntypedRecordUpdateArg,
+        ArgNames, BitArraySegment, CallArg, Constant, DefinitionLocation, Layer, Pattern,
+        Publicity, TypedConstant, TypedExpr, TypedPattern, TypedPatternBitArraySegment,
+        UntypedMultiPattern, UntypedPattern, UntypedRecordUpdateArg,
     },
     bit_array,
     build::{Origin, Target},
@@ -1035,8 +1035,6 @@ pub struct ModuleInterface {
     pub minimum_required_version: Version,
     pub type_aliases: HashMap<EcoString, TypeAliasConstructor>,
     pub documentation: Vec<EcoString>,
-    /// Wether there's any echo in the module.
-    pub contains_echo: bool,
     pub references: References,
 }
 
@@ -1058,6 +1056,21 @@ pub struct References {
     pub module_references: HashMap<EcoString, Vec<ModuleNameReference>>,
     pub label_references: HashMap<LabelKey, Vec<LabelReference>>,
     pub label_definitions: HashMap<LabelKey, Vec<LabelDefinition>>,
+    pub echo_usages: Vec<SrcSpan>,
+    /// Usages of `todo`. It is different from going through warnings about
+    /// `todo`, because this field also covers `todo`s in constants.
+    pub todo_usages: Vec<SrcSpan>,
+    pub panic_usages: Vec<SrcSpan>,
+}
+
+impl References {
+    /// The references to the entities in the given layer.
+    pub fn in_layer(&self, layer: Layer) -> &ReferenceMap {
+        match layer {
+            Layer::Value => &self.value_references,
+            Layer::Type => &self.type_references,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1510,6 +1523,14 @@ impl Deprecation {
     #[must_use]
     pub fn is_deprecated(&self) -> bool {
         matches!(self, Self::Deprecated { .. })
+    }
+
+    /// The deprecation message, if it's deprecated.
+    pub fn message(&self) -> Option<&str> {
+        match self {
+            Deprecation::NotDeprecated => None,
+            Deprecation::Deprecated { message } => Some(message),
+        }
     }
 }
 

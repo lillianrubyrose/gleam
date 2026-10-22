@@ -109,9 +109,6 @@ pub struct Environment<'a> {
     /// IDs and register the original names for them.
     pub deferred_type_variable_aliases: Vec<(u64, Arc<Type>)>,
 
-    /// Wether we ran into an `echo` or not while analysing the current module.
-    pub echo_found: bool,
-
     pub references: ReferenceTracker,
 
     pub dev_dependencies: &'a HashSet<EcoString>,
@@ -176,7 +173,6 @@ impl<'a> Environment<'a> {
             names,
             deferred_type_variable_aliases: Vec::new(),
             module_type_aliases: HashMap::new(),
-            echo_found: false,
             references: ReferenceTracker::new(),
             dev_dependencies,
         }
@@ -913,7 +909,7 @@ impl Environment<'_> {
                     }
                 }
                 EntityKind::ImportedModule { module_name } => {
-                    let _ = unused_modules.insert(module_name.clone());
+                    let _ = unused_modules.insert(module_name);
                     Warning::UnusedImportedModule { name, location }
                 }
                 EntityKind::ImportedType { module } => {
@@ -947,7 +943,7 @@ impl Environment<'_> {
                     unused_imported_items.push((
                         module.clone(),
                         Warning::UnusedImportedModuleAlias {
-                            module_name: module.clone(),
+                            module_name: module,
                             alias: name,
                             location,
                         },

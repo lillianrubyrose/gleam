@@ -20,7 +20,8 @@ use crate::{
 use camino::Utf8Path;
 use ecow::{EcoString, eco_format};
 use erlang_generation::{
-    BitArraySegmentSpecifier, DocContent, ErlangBuilder, ErlangModuleName, ErlangSourceBuilder,
+    BitArraySegmentSpecifier, DocContent, ErlangBuilder, ErlangBuiltInType, ErlangModuleName,
+    ErlangSourceBuilder,
 };
 use itertools::Itertools;
 use num_bigint::BigInt;
@@ -333,7 +334,7 @@ impl<'a> Generator<'a> {
             // This is an external type with no external annotation and no
             // phantom type variables. It is just `any()`.
             ([], false) => {
-                let any = builder.start_named_type("any");
+                let any = builder.start_built_in_named_type(ErlangBuiltInType::Any);
                 builder.end_named_type(any);
             }
             // This is an external type with no external annotation and some
@@ -341,7 +342,7 @@ impl<'a> Generator<'a> {
             // them: `any() | {gleam_phantom, A, B, ...}`
             ([], true) => {
                 let union = builder.start_union_type();
-                let any = builder.start_named_type("any");
+                let any = builder.start_built_in_named_type(ErlangBuiltInType::Any);
                 builder.end_named_type(any);
                 self.phantom_type(builder, phantom_type_variables);
                 builder.end_union_type(union);
@@ -483,6 +484,40 @@ fn type_parameter_name(type_: &Type) -> EcoString {
         TypeVar::Unbound { id } | TypeVar::Generic { id } => id_to_type_var_str(*id),
         TypeVar::Link { type_ } => type_parameter_name(type_),
     }
+}
+
+/// Extract bits, unit and size options from a bit array segment in a
+/// single pass. Returns the unit value (only when the segment has a
+/// Bits option) and the Size option value.
+fn collect_bit_array_options<Value>(
+    options: &[BitArrayOption<Value>],
+) -> (Option<u8>, Option<&Value>) {
+    let mut has_bits = false;
+    let mut unit_value = None;
+    let mut size_value = None;
+    for option in options {
+        match option {
+            BitArrayOption::Bits { .. } => has_bits = true,
+            BitArrayOption::Unit { value, .. } => unit_value = Some(*value),
+            BitArrayOption::Size { value, .. } => size_value = Some(value.as_ref()),
+            BitArrayOption::Bytes { .. }
+            | BitArrayOption::Int { .. }
+            | BitArrayOption::Float { .. }
+            | BitArrayOption::Utf8 { .. }
+            | BitArrayOption::Utf16 { .. }
+            | BitArrayOption::Utf32 { .. }
+            | BitArrayOption::Utf8Codepoint { .. }
+            | BitArrayOption::Utf16Codepoint { .. }
+            | BitArrayOption::Utf32Codepoint { .. }
+            | BitArrayOption::Signed { .. }
+            | BitArrayOption::Unsigned { .. }
+            | BitArrayOption::Big { .. }
+            | BitArrayOption::Little { .. }
+            | BitArrayOption::Native { .. } => {}
+        }
+    }
+    let unit_value = if has_bits { unit_value } else { None };
+    (unit_value, size_value)
 }
 
 impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
@@ -2588,26 +2623,45 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
         builder: &mut impl ErlangBuilder<Output>,
         segment: &'a TypedConstantBitArraySegment,
     ) {
+        let (bits_unit_value, size_value) = collect_bit_array_options(&segment.options);
+
         builder.bit_array_segment(segment.location);
         self.inlined_constant(builder, &segment.value);
-        match segment.size() {
-            Some(TypedConstant::Int {
-                int_value,
-                location,
-                ..
-            }) if int_value.is_negative() => {
+        match (size_value, bits_unit_value) {
+            (
+                Some(TypedConstant::Int {
+                    int_value,
+                    location,
+                    ..
+                }),
+                _,
+            ) if int_value.is_negative() => {
                 builder.int_expression(*location, BigInt::ZERO);
             }
-            Some(size) => self.inlined_constant(builder, size),
-            None => builder.bit_array_segment_default_size(),
+            (
+                Some(TypedConstant::Int {
+                    int_value,
+                    location,
+                    ..
+                }),
+                Some(unit),
+            ) => {
+                builder.int_expression(*location, int_value * unit);
+            }
+            (Some(size), _) => self.inlined_constant(builder, size),
+            (None, _) => builder.bit_array_segment_default_size(),
         }
-        self.bit_array_segment_specifiers(builder, segment);
+        self.bit_array_segment_specifiers(builder, segment, bits_unit_value.is_some());
     }
 
+    // When `omit_unit_specifier` is true, the unit was already multiplied
+    // into the size (e.g. size=8, unit=8 became 64), so we skip emitting
+    // the unit specifier. The BEAM rejects unit with the bitstring type.
     fn bit_array_segment_specifiers<Output, Expr>(
         &self,
         builder: &mut impl ErlangBuilder<Output>,
         segment: &'a BitArraySegment<Expr, Arc<Type>>,
+        omit_unit_specifier: bool,
     ) {
         let options = segment.options.iter();
         builder.bit_array_segment_specifiers(options.filter_map(|option| match option {
@@ -2629,6 +2683,7 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
             BitArrayOption::Big { .. } => Some(BitArraySegmentSpecifier::Big),
             BitArrayOption::Little { .. } => Some(BitArraySegmentSpecifier::Little),
             BitArrayOption::Native { .. } => Some(BitArraySegmentSpecifier::Native),
+            BitArrayOption::Unit { .. } if omit_unit_specifier => None,
             BitArrayOption::Unit { value, .. } => Some(BitArraySegmentSpecifier::Unit(*value)),
             BitArrayOption::Size { .. } => None,
         }));
@@ -3051,10 +3106,11 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
         } else {
             // If the bit array segment doesn't need any special handling we use the
             // regular printing functions to format its value and options.
+            let (bits_unit_value, size_value) = collect_bit_array_options(&segment.options);
             builder.bit_array_segment(segment.location);
             self.maybe_block_expr(builder, &segment.value);
-            self.bit_array_expression_segment_size(builder, segment);
-            self.bit_array_segment_specifiers(builder, segment);
+            self.bit_array_expression_segment_size(builder, size_value, bits_unit_value);
+            self.bit_array_segment_specifiers(builder, segment, bits_unit_value.is_some());
         }
     }
 
@@ -3066,26 +3122,45 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
     fn bit_array_expression_segment_size<Output>(
         &mut self,
         builder: &mut impl ErlangBuilder<Output>,
-        segment: &'a TypedExprBitArraySegment,
+        size: Option<&'a TypedExpr>,
+        bits_unit_value: Option<u8>,
     ) {
-        let Some(size) = segment.size() else {
+        let Some(size) = size else {
             builder.bit_array_segment_default_size();
             return;
         };
 
         // Sizes need some care: in Erlang, having a negative segment size
         // results in a runtime error. We can't do that in Gleam! So any
-        // negative value must be turned to zero instead:
-        if let TypedExpr::Int {
-            int_value,
-            location: size_location,
-            ..
-        } = &size
-        {
-            if int_value.is_negative() {
-                builder.int_expression(*size_location, BigInt::ZERO);
+        // negative value must be turned to zero instead.
+        //
+        // And when `bits_unit_value` is set the unit has been multiplied
+        // into the size so the unit specifier can be omitted.
+        //
+        // For example, size=8 with unit=8 produces 64, emitting <<X:64/bitstring>>
+        // instead of <<X:8/bitstring-unit:8>>.
+        if let Some(unit) = bits_unit_value {
+            // Multiply the size by the unit
+            if let TypedExpr::Int { int_value, .. } = &size {
+                if int_value.is_negative() {
+                    builder.int_expression(size.location(), BigInt::ZERO);
+                } else {
+                    builder.int_expression(size.location(), int_value.clone() * unit);
+                }
             } else {
-                builder.int_expression(*size_location, int_value.clone());
+                let call =
+                    builder.start_remote_call(size.location(), ErlangModuleName::erlang(), "max");
+                builder.int_expression(size.location(), BigInt::ZERO);
+                builder.binary_operator(size.location(), "*");
+                self.maybe_block_expr(builder, size);
+                builder.int_expression(size.location(), unit.into());
+                builder.end_call(call);
+            }
+        } else if let TypedExpr::Int { int_value, .. } = &size {
+            if int_value.is_negative() {
+                builder.int_expression(size.location(), BigInt::ZERO);
+            } else {
+                builder.int_expression(size.location(), int_value.clone());
             }
         } else {
             let call =
@@ -3346,7 +3421,7 @@ impl<'a, 'generator> FunctionGenerator<'a, 'generator> {
                         location,
                         &self.new_erlang_variable(&gleam_name, location),
                     );
-                    builder.int_expression(location, value.clone());
+                    builder.int_expression(location, value);
                 }
             }
         }
@@ -4266,7 +4341,7 @@ impl<'a> TypeGenerator<'a> {
             TypeVar::Link { type_ } => self.type_(builder, type_),
             TypeVar::Generic { id, .. } | TypeVar::Unbound { id, .. } => {
                 if self.var_as_any || self.type_variable_is_used_exactly_once(*id) {
-                    let any = builder.start_named_type("any");
+                    let any = builder.start_built_in_named_type(ErlangBuiltInType::Any);
                     builder.end_named_type(any);
                 } else {
                     builder.type_variable(&id_to_type_var_str(*id));
@@ -4295,27 +4370,27 @@ impl<'a> TypeGenerator<'a> {
         match name {
             "Nil" => builder.literal_atom_type("nil"),
             "Int" | "UtfCodepoint" => {
-                let integer = builder.start_named_type("integer");
+                let integer = builder.start_built_in_named_type(ErlangBuiltInType::Integer);
                 builder.end_named_type(integer);
             }
             "String" => {
-                let string = builder.start_named_type("binary");
+                let string = builder.start_built_in_named_type(ErlangBuiltInType::Binary);
                 builder.end_named_type(string);
             }
             "Bool" => {
-                let boolean = builder.start_named_type("boolean");
+                let boolean = builder.start_built_in_named_type(ErlangBuiltInType::Boolean);
                 builder.end_named_type(boolean);
             }
             "Float" => {
-                let float = builder.start_named_type("float");
+                let float = builder.start_built_in_named_type(ErlangBuiltInType::Float);
                 builder.end_named_type(float);
             }
             "BitArray" => {
-                let bitstring = builder.start_named_type("bitstring");
+                let bitstring = builder.start_built_in_named_type(ErlangBuiltInType::Bitstring);
                 builder.end_named_type(bitstring);
             }
             "List" => {
-                let list = builder.start_named_type("list");
+                let list = builder.start_built_in_named_type(ErlangBuiltInType::List);
                 let list_item = arguments
                     .first()
                     .expect("prelude type list with no argument");
@@ -4357,7 +4432,7 @@ impl<'a> TypeGenerator<'a> {
     ) {
         let name = erl_safe_type_name(to_snake_case(name));
         if self.current_module == module {
-            let type_ = builder.start_named_type(&name);
+            let type_ = builder.start_custom_named_type(&name);
             for argument in arguments {
                 self.type_(builder, argument);
             }

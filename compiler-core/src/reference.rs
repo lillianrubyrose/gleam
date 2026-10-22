@@ -74,13 +74,26 @@ pub enum ReferenceKind {
     /// import gleam/dynamic/decode.{type Dynamic}
     /// //                                ^^^^^^^ Import
     /// ```
-    /// The contained span is the location of `as ...` part, if it exists,
-    /// otherwise it will just be empty. For example:
-    /// ```gleam
-    /// import gleam/option.{None as Nothing}
-    /// //                       ^^^^^^^^^^^ Alias span
-    /// ```
-    Import(SrcSpan),
+    Import {
+        /// Full location of the import:
+        ///
+        /// ```gleam
+        /// import gleam/option.{type Option as Wibble}
+        /// //                   ^^^^^^^^^^^^^^^^^^^^^
+        /// import gleam/option.{Some as Wibble}
+        /// //                   ^^^^^^^^^^^^^^
+        /// ```
+        location: SrcSpan,
+        /// End position of the name:
+        ///
+        /// ```gleam
+        /// import gleam/option.{type Option as Wibble}
+        /// //                              ^
+        /// import gleam/option.{type Option}
+        /// //                             ^
+        /// ```
+        name_end_position: u32,
+    },
     /// The original definition location of a type or value. This also counts as
     /// a reference for renaming and "find references" purposes. For example:
     ///
@@ -331,6 +344,11 @@ pub struct ReferenceTracker {
     /// The locations at which each record field label is defined, one per
     /// variant that defines it, used for renaming and go-to definition.
     pub label_definitions: HashMap<LabelKey, Vec<LabelDefinition>>,
+    pub echo_usages: Vec<SrcSpan>,
+    /// Usages of `todo`. It is different from going through warnings about
+    /// `todo`, because this field also covers `todo`s in constants.
+    pub todo_usages: Vec<SrcSpan>,
+    pub panic_usages: Vec<SrcSpan>,
 
     /// Maps a module's canonical name to the node of the import it was brought
     /// in by. Every import is inserted here (aliased or not), keyed by its full
@@ -643,7 +661,7 @@ impl ReferenceTracker {
                 };
                 self.register_module_name_reference(module.clone(), reference);
             }
-            ReferenceKind::Import(_) | ReferenceKind::Definition => {}
+            ReferenceKind::Import { .. } | ReferenceKind::Definition => {}
             ReferenceKind::Alias | ReferenceKind::Unqualified => {
                 self.add_reference_edge(referenced_name.clone(), EntityLayer::Value);
             }
@@ -676,7 +694,7 @@ impl ReferenceTracker {
                 };
                 self.register_module_name_reference(module.clone(), reference);
             }
-            ReferenceKind::Import(_) | ReferenceKind::Definition => {}
+            ReferenceKind::Import { .. } | ReferenceKind::Definition => {}
             ReferenceKind::Alias | ReferenceKind::Unqualified => {
                 self.register_type_reference_in_call_graph(referenced_name.clone());
             }

@@ -13,6 +13,10 @@
   patterns.
   ([Andrey Kozhev](https://github.com/ankddev))
 
+- The compiler is now fault tolerant when providing an error for a redundant list
+  prepend like `[..wobble]`.
+  ([0xda157](https://github.com/0xda157))
+
 ### Build tool
 
 - `gleam remove` now rejects invalid package names with an error explaining
@@ -21,11 +25,163 @@
   `gleam_otp`, if there is one.
   ([Tom Voet](https://github.com/tomvoet))
 
+- When Hex dependencies change version the build tool now prints a link to the
+  diff on Hex, making it easier to review and audit dependency updates.
+  ([Manas Ganesh Dasari](https://github.com/ManasDasri))
+
+- The Hex files page will now be used for the view-source link in generated
+  documentation when the package's source repository uses an unknown forge or
+  is not set.
+  ([Alex Hinde](https://github.com/apex-hinde))
+
+- The Hex credentials file is now written with read-write permissions for the
+  owner only (0600 on Unix), preventing other users from reading it.
+  ([bala-bhargav](https://github.com/bala-bhargav))
+
 ### Language server
 
 - The language server will now offer "Discard unused variable" on each of
   alternative patterns.
   ([Andrey Kozhev](https://github.com/ankddev))
+
+- The language server now allows to find references of `echo`. For example,
+
+  ```gleam
+  pub fn wibble(woo) {
+    echo woo
+  //^^^^
+    echo wobble(woo)
+  //^^^^
+  }
+
+  pub fn wobble(woo) {
+    echo woo
+  //^^^^
+  }
+  ```
+
+  When triggering on any of denoted places, it will show all usages.
+  ([Andrey Kozhev](https://github.com/ankddev))
+
+- The language server now allows to highlight all `echo` in file. For example,
+
+  ```gleam
+  pub fn wibble(woo) {
+    echo woo
+  //^^^^
+    echo wobble(woo)
+  //^^^^
+  }
+
+  pub fn wobble(woo) {
+    echo woo
+  //^^^^
+  }
+  ```
+
+  If this feature is enabled in your editor, hovering any of denoted places will
+  highlight all of them.
+  ([Andrey Kozhev](https://github.com/ankddev))
+
+- The language server now allows to find references of `todo`. For example,
+
+  ```gleam
+  pub const wubble = todo
+  //                 ^^^^
+
+  pub fn wibble() {
+    todo as "unimplemented yet"
+  //^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  }
+
+  pub fn empty() {}
+  //^^^^^^^^^^^^ Empty functions are shown too!
+
+  pub fn block() {
+    {}
+  //^^ And empty blocks too!
+  }
+  ```
+
+  When triggering on any of denoted places, it will show all usages.
+  ([Andrey Kozhev](https://github.com/ankddev))
+
+- The language server now allows to highlight all `todo` in file. For example,
+
+  ```gleam
+  pub const wubble = todo
+  //                 ^^^^
+
+  pub fn wibble() {
+    todo as "unimplemented yet"
+  //^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  }
+
+  pub fn empty() {}
+  //^^^^^^^^^^^^ Empty functions are highlighted too!
+
+  pub fn block() {
+    {}
+  //^^ And empty blocks too!
+  }
+  ```
+
+  If this feature is enabled in your editor, hovering any of denoted places will
+  highlight all of them.
+  ([Andrey Kozhev](https://github.com/ankddev))
+
+- The language server now allows to find references of `panic`. For example,
+
+  ```gleam
+  pub fn wibble() {
+    panic
+  //^^^^^
+  }
+
+  pub fn wobble() {
+    panic as "unimplemented"
+  //^^^^^^^^^^^^^^^^^^^^^^^^
+  }
+  ```
+
+  When triggering on any of denoted places, it will show all usages.
+  ([Andrey Kozhev](https://github.com/ankddev))
+
+- The language server now allows to highlight all `panic` in file. For example,
+
+  ```gleam
+  pub fn wibble() {
+    panic
+  //^^^^^
+  }
+
+  pub fn wobble() {
+    panic as "unimplemented"
+  //^^^^^^^^^^^^^^^^^^^^^^^^
+  }
+  ```
+
+  If this feature is enabled in your editor, hovering any of denoted places will
+  highlight all of them.
+  ([Andrey Kozhev](https://github.com/ankddev))
+
+- The language server can now offer a "Remove redundant list prepend" code
+  action, for example:
+
+  ```gleam
+  const wibble = [1, 2]
+  const wobble = [..wibble]
+               // ^^^^^^^^ Trigger code action here
+  ```
+
+  becomes
+
+  ```gleam
+  const wibble = [1, 2]
+  const wobble = wibble
+  ```
+
+  ([0xda157](https://github.com/0xda157))
 
 ### Bug fixes
 
@@ -33,10 +189,38 @@
   duplicate module name when triggered on qualified values.
   ([Andrey Kozhev](https://github.com/ankddev))
 
+- Fixed a bug where bad error message would be shown when trying to publish
+  package with no README on Windows.
+  ([Andrey Kozhev](https://github.com/ankddev))
+
+- Fixed a bug where the build tool would not reject invalid application names
+  if one is returned by the Hex API.
+  ([Louis Pilfold](https://github.com/lpil))
+
+- Fixed a bug where a type error caused by a constant used in a clause guard
+  would point to the definition of the constant instead of the guard.
+  ([DualFroz](https://github.com/dualfroz))
+
+- The language server will now remove imports of prelude items when renaming
+  them to their original name.
+  ([Andrey Kozhev](https://github.com/ankddev))
+
+## v1.19.2 - 2026-10-12
+
+### Bug fixes
+
+- Fixed a bug where the compiler would generate invalid Erlang code for user
+  defined types, causing external tools like Dyalizer to crash.
+  ([Giacomo Cavalieri](https://github.com/giacomocavalieri))
+
+- Fixed a bug where the build tool would not reject invalid application names
+  if one is returned by the Hex API.
+  ([Louis Pilfold](https://github.com/lpil))
+
 ## v1.19.1 - 2026-10-07
 
 ### Bug fixes
 
-- Fixed a bug where the `export javascript-prelude` and `export
-  typescript-prelude` commands would not run.
+- Fixed a bug where the `export javascript-prelude` and
+  `export typescript-prelude` commands would not run.
   ([Louis Pilfold](https://github.com/lpil))

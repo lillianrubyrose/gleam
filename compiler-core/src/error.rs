@@ -28,7 +28,8 @@ use src_span::SrcSpan;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::io::Write;
+use std::fmt::Write as FmtWrite;
+use std::io::Write as IoWrite;
 use std::path::PathBuf;
 use std::sync::Arc;
 use termcolor::Buffer;
@@ -806,12 +807,17 @@ impl FileIoAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileIoCause {
     Other(String),
+    NotFound,
     CacheMetadataFormatIncorrect,
 }
 
 impl FileIoCause {
     pub fn std_io(error: std::io::Error) -> Self {
-        Self::Other(error.to_string())
+        if let std::io::ErrorKind::NotFound = error.kind() {
+            Self::NotFound
+        } else {
+            Self::Other(error.to_string())
+        }
     }
 }
 
@@ -1960,6 +1966,10 @@ Erlang modules must have unique names regardless of the subfolders where their
                             "\n\nThe error message from the file IO library was:\n\n    ",
                         );
                         text.push_str(error.as_str());
+                    }
+                    FileIoCause::NotFound => {
+                        write!(text, "\n\nThis {} does not exist.", kind.text())
+                            .expect("successfully write to the buffer");
                     }
                     FileIoCause::CacheMetadataFormatIncorrect => text.push_str(
                         "
@@ -3523,13 +3533,13 @@ being used as a type constructor."
             }
         }
 
-        TypeError::UnnecessarySpreadOperator { location, arity } => {
+        TypeError::RecordUpdateWithoutChanges { location, arity } => {
             let text = wrap_format!(
                 "This record has {arity} fields and you have already \
 assigned variables to all of them."
             );
             Diagnostic {
-                title: "Unnecessary spread operator".into(),
+                title: "Record update without changes".into(),
                 text,
                 hint: None,
                 level: Level::Error,
@@ -4703,10 +4713,7 @@ The missing patterns are:\n",
             let text = wrap_format!(
                 "This value is not available as it is defined using externals, \
 and there is no implementation for the {} target.",
-                match current_target {
-                    Target::Erlang => "Erlang",
-                    Target::JavaScript => "JavaScript",
-                }
+                current_target.as_presentable_str()
             );
             let hint = wrap("Did you mean to build for a different target?");
             Diagnostic {
@@ -4731,10 +4738,7 @@ and there is no implementation for the {} target.",
             name,
             target,
         } => {
-            let target = match target {
-                Target::Erlang => "Erlang",
-                Target::JavaScript => "JavaScript",
-            };
+            let target = target.as_presentable_str();
             let text = wrap_format!(
                 "The `{name}` function is public but doesn't have an \
 implementation for the {target} target. All public functions of a package \
@@ -5384,6 +5388,32 @@ and cannot be accessed by other modules."
                 extra_labels: vec![],
             }),
         },
+        TypeError::ListPrependWithoutElements {
+            location,
+            tail_location,
+        } => {
+            let text = wrap(
+                "The list prepend syntax is being used here, but \
+no elements are being prepended. Remove the `[..` and the `]` and use the \
+original list directly.",
+            );
+
+            Diagnostic {
+                title: "Redundant list prepend".to_string(),
+                text,
+                hint: None,
+                level: Level::Error,
+                location: Some(Location {
+                    label: Label {
+                        text: Some("This prepend does nothing".into()),
+                        span: SrcSpan::new(location.start, tail_location.start),
+                    },
+                    path: path.clone(),
+                    src: src.clone(),
+                    extra_labels: vec![],
+                }),
+            }
+        }
     })
 }
 
